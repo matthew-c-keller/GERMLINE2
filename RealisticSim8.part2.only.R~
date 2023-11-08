@@ -1,0 +1,933 @@
+#RealisticSim1
+
+#this comes from MasterAM.v5-9.Incl.SNPs.R
+#hi
+#Purpose of this is a final run of realistic simulated data
+
+#May 25 - Changes from .v2 to current version (v3)
+#1) remove large files that are written out
+#2) saves time
+#3) writes EST.RUNS with header
+#4) makes EM algorithm finish more often by increasing its for both alg 0 & alg 2 and choosing better priors
+#5) fixes header issue in Results writeout
+
+#May 26 - changes from v3 to v4:
+#1) truly corrects header
+#2) Removes n=12600 - too big and slow
+#3) Corrects the snp=800 runs, which failed before, and fixed the times
+
+
+#Changes from v4 to v5:
+#1) have CV=800 & CV=10k
+#2) have Ne=100k
+#3)
+
+#V6 is same as v5 but just run again, in new folder, and with 20 GE runs
+
+
+
+#Load packages & functions needed
+require(foreach)
+require(doMC)
+require(data.table)
+require(moments)
+require(Rcpp) #for the source code below, makes matrix mult much faster (by ~ 3-fold)
+require(inline)
+
+
+#FUNCTIONS
+source("/work/KellerLab/mmkeller/AssortMate/RealisticSim.Functions.R")
+
+#From inline package & RcppEigen - faster way of doing matrix multiplication
+MatMult <- cxxfunction(signature(tm="NumericMatrix",
+                           tm2="NumericMatrix"),
+                 plugin="RcppEigen",
+                 body="
+NumericMatrix tm22(tm2);
+NumericMatrix tmm(tm);
+
+const Eigen::Map<Eigen::MatrixXd> ttm(as<Eigen::Map<Eigen::MatrixXd> >(tmm));
+const Eigen::Map<Eigen::MatrixXd> ttm2(as<Eigen::Map<Eigen::MatrixXd> >(tm22));
+
+Eigen::MatrixXd prod = ttm*ttm2;
+return(wrap(prod));
+                 ")
+
+#Fast matrix multiplication using Rcpp
+mmult <- function(X1,X2) {
+if(is.vector(X1)) {X1 <- matrix(X1,ncol=1)}
+if(is.vector(X2)) {X2 <- matrix(X2,ncol=1)}
+if (ncol(X1) != nrow(X2)) stop("ncol X1 != nrow X2") else {return(MatMult(X1,X2))}
+}
+
+
+
+#Global options for this script - important to run this or script breaks
+op <-  options(stringsAsFactors=FALSE)
+
+
+
+
+##############################################################################
+#DEFINE WILDCARDS
+#Must run this section. These need to be changed as you see fit
+##############################################################################
+
+###STATIC WILDCARDS
+#Location of files (make sure to include / at end of folder paths!)
+DATA.LOC <- "/work/KellerLab/mmkeller/AssortMate/UKBiobank/Eur/Phased/"
+RESULTS.LOC <- "/local/scratch/mmkeller/AM.Realistic8/"
+CHR.PREF <- "chr" #prefix of file names
+MASTER.EXT <-  ".9May_n50k" #this has n=50k and 535082 SNPs, 533336 above .01 and less than .5 MAF
+NEW.MASTER.EXT <- ".Realistic7" #for the new SNP chips created
+
+RESULTS.EXT <- "8" #What is the results extension you'll be using?
+
+#User input
+GE.MAX.CORES <- 20  #this might need to be changed depending on memory use. Each m=9k takes ~12Gb
+EST.MAX.CORES <- 40
+EST.SEED <- 12345678
+
+#GE user input
+POPULATION.SIZE <- 250000 #***
+NUM.CVs <- c(2000)
+GE.REPS <- 40 #number of GE reps per row #*** 30
+VA <- 1 #VA at gen 0 for stndz
+VE <- 1 #VE at gen 0 for stndz
+MATE.COR <- .4
+CHR <- 1:22
+NUM.GENERATIONS <- 20   #number of generations  #*** 15
+COMM.THRESHOLD <- .01  #No longer a vector - just a scalar
+GENS.TO.WRITE <- c(NUM.GENERATIONS) #final 1 gens
+
+
+#EST user input
+RUN.REML <- TRUE
+NUM.SNPs <- c(2000,10000,50000,250000)
+SAMPLE.SIZE <- c(1000,2000,4000,8000) #reduced this to reduce memory; a vector of length 2
+DESIRED.SEM <- .0125 #***  .02
+MIN.RUNS <- 5 #minimal number of estimation runs per sample size & num.snps #***  3
+
+#Non-input
+POP.SIZE <- rep(POPULATION.SIZE,NUM.GENERATIONS)  #population size over time
+#POP.SIZE[NUM.GENERATIONS] <- floor(POP.SIZE[length(POP.SIZE)]/2) #at last generation we want half replacement rate so that we have no siblings
+OFFSPRING_DIST <- rep("p",NUM.GENERATIONS) #p or P=Poisson distribution, f or F=fixed distribution
+#OFFSPRING_DIST[NUM.GENERATIONS] <- "f" #last generation is fixed
+MAXSNP <- max(NUM.SNPs)
+
+
+#CREATE MASTER SPREADSHEETS
+GE.RUNS <- expand.grid(1:GE.REPS,NUM.CVs,MATE.COR)
+names(GE.RUNS) <- c('GE.run','NUM.CVs','MATE.COR')
+GE.RUNS$FOLDER <- paste0(RESULTS.LOC,"ROW",1:nrow(GE.RUNS),".GErun",GE.RUNS$GE.run,".cv",GE.RUNS$NUM.CVs,".r",GE.RUNS$MATE.COR)
+
+#MASTER SPREADSHEET FOR ESTIMATES
+EST.RUNS <- expand.grid(1:GE.REPS,NUM.CVs,MATE.COR,NUM.SNPs,SAMPLE.SIZE)
+names(EST.RUNS) <- c('GE.run','NUM.CVs','MATE.COR','NUM.SNPs','SAMPLE.SIZE')
+EST.RUNS$FOLDER <- paste0(RESULTS.LOC,"ROW",1:nrow(GE.RUNS),".GErun",GE.RUNS$GE.run,".cv",GE.RUNS$NUM.CVs,".r",GE.RUNS$MATE.COR)
+EST.RUNS <- EST.RUNS[order(EST.RUNS$GE.run),]
+EST.RUNS$nOm <- EST.RUNS$SAMPLE.SIZE/EST.RUNS$NUM.SNPs
+
+EST.RUNS$IT <- ((2*(EST.RUNS$NUM.SNPs+EST.RUNS$NUM.CVs))/((EST.RUNS$SAMPLE.SIZE^2)*DESIRED.SEM^2))/GE.REPS
+EST.RUNS$IT <- ceiling(EST.RUNS$IT)
+EST.RUNS$IT[EST.RUNS$IT < MIN.RUNS] <- MIN.RUNS
+
+EST.RUNS$WHICH.SNP <- 1
+for (i in 2:length(NUM.SNPs)) {EST.RUNS$WHICH.SNP[EST.RUNS$NUM.SNPs %in% NUM.SNPs[i]] <- i} 
+
+EST.RUNS$orig.row <- 1:nrow(EST.RUNS)
+
+EST.RUNS <- EST.RUNS[EST.RUNS$GE.run != 2,] #!!! CHANGED
+
+
+set.seed(EST.SEED)
+EST.RUNS <- EST.RUNS[sample(1:nrow(EST.RUNS),nrow(EST.RUNS)),]
+
+
+setwd(RESULTS.LOC)
+
+write.table(EST.RUNS,paste0(RESULTS.LOC,"EST-",RESULTS.EXT,".RUNS"),col.names=TRUE,row.names=FALSE,quote=FALSE)
+#write.table(GE.RUNS,paste0(RESULTS.LOC,"GE-",RESULTS.EXT,".RUNS"),col.names=TRUE,row.names=FALSE,quote=FALSE) #!!! CHANGED
+
+##############################################################################
+#END WILDCARDS
+##############################################################################
+
+
+
+
+if (NUM.CVs > min(NUM.SNPs)) stop ("NUM.CVs must always be less than or equal to the min NUM.SNPs")
+
+
+
+
+
+
+#!!! BEGIN COMMENT OUT
+#
+#
+#
+####################
+##A1 Get random subset of max(NUM.SNPs) SNPs - thsi only needs to be done ONCE so comment out if it's already run!
+#
+#
+#registerDoMC(cores=GE.MAX.CORES)
+#
+#
+##First get SNP list
+#AF  <-  foreach(THIS.CHR = CHR,.combine='rbind') %dopar% {
+#    frq.position <- fread(paste0(DATA.LOC,CHR.PREF,THIS.CHR,MASTER.EXT,".frq"),header=FALSE,skip=1,colClasses=c(rep('numeric',2),'NULL','NULL','numeric','NULL'),data.table=FALSE)
+#    frq.position <- frq.position[frq.position[,3] > COMM.THRESHOLD & frq.position[,3] < .5,] 
+#     return(frq.position)} #end dopar
+##names & order to AF02
+#colnames(AF) <- c('CHR','POS','MAF')
+#AF$ord <- 1:nrow(AF)
+#
+##Create DD data.frame for later use of deciding where SNPs are
+#dd <- diff(AF$CHR)
+#ends <- c(which(dd!=0),nrow(AF)) 
+#starts <- c(1,which(dd!=0)+1)
+#DD2 <- data.frame(chr=CHR,len=NA,prop=NA)
+#for (i in 1:length(CHR)){DD2$len[i] <- AF$POS[ends[i]]-AF$POS[starts[i]]}
+#Tot.length <- sum(DD2$len)
+#DD2$prop <- DD2$len/Tot.length
+#DD2$numsnps <- round(DD2$prop*MAXSNP,0)
+#
+##Choose which SNPs will be on SNP panel
+#XX  <-  foreach(THIS.CHR = CHR) %dopar% {
+#    THISCHR <- AF[AF$CHR==THIS.CHR,]
+#    OUR.SNPs <- THISCHR[sort(sample(1:nrow(THISCHR),DD2$numsnps[DD2$chr==THIS.CHR],replace=FALSE)),]
+# #File names
+#    INCLUDEFILE <- paste0(DATA.LOC,CHR.PREF,THIS.CHR,NEW.MASTER.EXT,".include")
+#    OLDSNPFILE <- paste0(DATA.LOC,CHR.PREF,THIS.CHR,MASTER.EXT)
+#    NEWSNPFILE <- paste0(DATA.LOC,CHR.PREF,THIS.CHR,NEW.MASTER.EXT)
+#    write.table(OUR.SNPs[,c('CHR','POS')],INCLUDEFILE,col.names=FALSE,row.names=FALSE,quote=FALSE)
+# #VCF tools
+#    (vcftools.snp.cmd <- paste0("vcftools --gzvcf ",OLDSNPFILE,".vcf.gz --positions ",INCLUDEFILE," --recode --stdout | gzip -c > ",NEWSNPFILE,".vcf.gz"))
+#    system(vcftools.snp.cmd)
+#    print(THIS.CHR)}
+#
+#
+##Now get frequency information on these snps
+#XX <-  foreach(THIS.CHR = CHR,.combine='rbind') %dopar% {
+#    NEWSNPFILE <- paste0(DATA.LOC,CHR.PREF,THIS.CHR,NEW.MASTER.EXT)
+#    (vcftools.cmd <- paste0("vcftools --gzvcf ",NEWSNPFILE,".vcf.gz --freq2 --out ",NEWSNPFILE))
+#    system(vcftools.cmd)}
+#
+##Finally, create IMPUTE formated data of the above SNP files
+# XX  <-  foreach(THIS.CHR = CHR) %dopar% { 
+#     NEWSNPFILE <- paste0(DATA.LOC,CHR.PREF,THIS.CHR,NEW.MASTER.EXT)
+#    (vcftools.impute.cmd <- paste0("vcftools --gzvcf ",NEWSNPFILE,".vcf.gz --IMPUTE --out ",NEWSNPFILE))
+#    system(vcftools.impute.cmd)
+#    print(THIS.CHR)
+#} #end forloop
+####################
+#
+#
+#
+#
+
+#
+#
+#
+#
+####################
+##A2 Get 2 different matrices of MAF for the 2 COMM.THRESHOLDS
+##NOTE: all distances in the VCF files are in build 37
+#
+#registerDoMC(cores=GE.MAX.CORES)
+#
+##First COMM.THRESHOLD
+#All.freqs  <-  foreach(THIS.CHR = CHR,.combine='rbind') %dopar% {
+#    FRQFILE <- paste0(DATA.LOC,CHR.PREF,THIS.CHR,NEW.MASTER.EXT,".frq")
+#    frq.position <- fread(FRQFILE,header=FALSE,skip=1,colClasses=c(rep('numeric',2),'NULL','NULL','numeric','NULL'),data.table=FALSE)
+#    frq.position <- frq.position[frq.position[,3] > COMM.THRESHOLD & frq.position[,3] < .5,]  #THIS DETERMINES MIN CV & SNP MAF
+#     return(frq.position)
+#} #end dopar
+#
+##names & order to All.freqs02
+#colnames(All.freqs) <- c('CHR','POS','MAF')
+#All.freqs$ord <- 1:nrow(All.freqs)
+####################
+#
+#
+#
+#if (max(NUM.SNPs) > nrow(All.freqs)) stop ("the max of NUM.SNPs must be less than or equal to the total number of SNPs being input for the simulation")
+#
+#
+#
+#
+###############################################################################
+##A2 BEGIN MASTER FOREACH LOOP & CREATE FOLDER & SET WD
+#
+#DAT <- foreach(THIS.RUN = 1:nrow(GE.RUNS),.combine='rbind') %dopar% {
+#
+#system(paste0("mkdir -p ",GE.RUNS$FOLDER[THIS.RUN]))
+#setwd(GE.RUNS$FOLDER[THIS.RUN])
+#THISRUN.LOC <- paste0(getwd(),"/")
+#    
+###############################################################################
+#
+#
+#
+#
+#
+#
+##########################################################
+#########PART B - From Step1 R Script
+#
+#
+#
+####################
+##B1 Choose CVs for all generations, ensuring that there is at least one CV per chr, for FIRST MAF threshold
+#
+##Create DIST data.frame for later use of deciding where CVs are
+#dd <- diff(All.freqs$CHR)
+#ends <- c(which(dd!=0),nrow(All.freqs)) 
+#starts <- c(1,which(dd!=0)+1)
+#DIST2 <- data.frame(chr=CHR,len=NA,prop=NA,numcvs=NA)
+#for (i in 1:length(CHR)){DIST2$len[i] <- All.freqs$POS[ends[i]]-All.freqs$POS[starts[i]]}
+#
+##What is the length of each chromosome & how many CVs per?
+##this section has been modified so that it works not only for chromosomes that are listed exactly sequentially e.g. c(1,3,2,4:22) and with no gaps e.g. c(1:3,5:22)
+#Tot.length <- sum(DIST2$len)
+#DIST2$prop <- DIST2$len/Tot.length
+#DIST2$numcvs <- round(DIST2$prop*GE.RUNS$NUM.CVs[THIS.RUN],0)
+#DIST2$numcvs[DIST2$numcvs==0] <- 1  #NOTE: there is a minimum of 1 CV per chromosome
+#
+##Ensure the number of CVs is exactly what you want
+#if (sum(DIST2$numcvs) > GE.RUNS$NUM.CVs[THIS.RUN]) {
+#sub <- rep(0,nrow(DIST2))
+#num.to.sub <- sum(DIST2$numcvs) - GE.RUNS$NUM.CVs[THIS.RUN]
+#sub2 <- sub+ c(rep(-1,num.to.sub),rep(0,nrow(DIST2)-num.to.sub))
+#DIST2$numcvs <- DIST2$numcvs + sub2
+#}
+#
+#if (sum(DIST2$numcvs) < GE.RUNS$NUM.CVs[THIS.RUN]) {
+#sub <- rep(0,nrow(DIST2))
+#num.to.sub <-  GE.RUNS$NUM.CVs[THIS.RUN] - sum(DIST2$numcvs)
+#sub2 <- sub+ c(rep(1,num.to.sub),rep(0,nrow(DIST2)-num.to.sub))
+#DIST2$numcvs <- DIST2$numcvs + sub2
+#}
+#
+#
+#
+#### FOR LOOP to write out CVs
+##Choose & write out CVs for each replication
+#for (THIS.CHR in CHR){
+#    Chr.freqs <- All.freqs[All.freqs$CHR==THIS.CHR,]
+#    subset.rows <- sort(sample(1:nrow(Chr.freqs),DIST2$numcvs[DIST2$chr==THIS.CHR],replace=FALSE)) 
+#    if (THIS.CHR==1) {CV.INFO <- Chr.freqs[subset.rows,]
+#      } else {CV.INFO <- rbind(CV.INFO,Chr.freqs[subset.rows,])}
+#}
+#
+#
+##write out the CVs
+#effectsizes <- sqrt(1/(2*as.numeric(CV.INFO$MAF)*(1-as.numeric(CV.INFO$MAF))))
+#CV.INFO$alpha <- rnorm(nrow(CV.INFO),0,sd=effectsizes)
+#CV.INFO$dom <- rep(0,nrow(CV.INFO))
+##tapply(CV.INFO$alpha,CV.INFO$brks,sd) #check
+#write.table(CV.INFO[,c('CHR','POS')],file="CVs",quote=FALSE,row.names=FALSE,col.names=FALSE)
+#write.table(CV.INFO,file="CV.INFO",quote=FALSE,row.names=FALSE,col.names=TRUE)
+#
+####################
+#
+#
+#
+#
+#
+####################
+##B3 --file_pop_info
+#
+##Define PHENO.MATE.COR
+#PHENO.MATE.COR <- rep(GE.RUNS$MATE.COR[THIS.RUN],NUM.GENERATIONS)
+#
+##NEW GE VERSION
+#INFO.COL4 <- rep("thr",length(POP.SIZE))
+#INFO.COL5 <- rep(1,length(POP.SIZE))
+#INFO.COL6 <- rep(1,length(POP.SIZE))
+##write it out
+#write.table(cbind(POP.SIZE,PHENO.MATE.COR,OFFSPRING_DIST,INFO.COL4,INFO.COL5,INFO.COL6),file="par.pop1.info.txt",quote=FALSE,row.names=FALSE,col.names=c("pop_size","mat_cor","offspring_dist","selection_func","selection_func_par1","selection_func_par2"))
+#
+####################
+#
+#
+#
+#
+#
+####################
+##B4 --file_hap_name
+#
+##if (GE.RUNS$NUM.SNPs[THIS.RUN]==0) {THIS.FILE <- paste0(THISRUN.LOC,CHR.PREF,CHR,".CVs.impute")
+##} else { 
+#
+#THIS.FILE <- paste0(DATA.LOC,CHR.PREF,CHR,NEW.MASTER.EXT,".impute")
+#    
+#a1=paste(THIS.FILE,".hap",sep="")
+#a2=paste(THIS.FILE,".legend",sep="")
+#a3=paste(THIS.FILE,".hap.indv",sep="")
+#a=cbind(CHR,a1,a2,a3)
+#write.table(a,file="par.pop1.hap_sample_address.txt",quote=FALSE,row.names=FALSE,col.names=c("chr","hap","legend","sample")) #not sure why there are column names here
+####################
+#
+#
+#
+#
+#
+####################
+##B5 --file_cv_info depending on GE version
+#
+##NEW GE VERSION
+#cv_info_R=as.matrix(CV.INFO[,c("CHR","POS","alpha","dom")])
+#write.table(cv_info_R,file="par.pop1.cv_info.txt",quote=FALSE,row.names=FALSE,col.names=TRUE)
+#
+####################
+#
+#
+#
+#
+#
+####################
+##B6 -  loop across chromosomes to create the GE input files - this by far is the longest step
+##have to do it serially because of the outer foreach loop would otherwise spawn too many processes - takes ~ 4 mins
+#for(THIS.CHR in CHR) {
+#    #Make phased (IMPUTE) format for CVs only
+##***    XX  <-  foreach(THIS.CHR = CHR,.combine='rbind') %dopar% { #uncomment this line only for testing
+#    (vcftools.cv.cmd <- paste0("vcftools --gzvcf ",DATA.LOC,CHR.PREF,THIS.CHR,NEW.MASTER.EXT,".vcf.gz --IMPUTE --positions ",THISRUN.LOC,"CVs --out ",THISRUN.LOC,CHR.PREF,THIS.CHR,".CVs"))
+#    system(vcftools.cv.cmd)
+#    print(THIS.CHR)
+#} #end forloop
+####################
+#
+#
+#
+#    
+#
+####################
+##B7 --file_cvs
+#b=paste(THISRUN.LOC,CHR.PREF,CHR,".CVs.impute.hap",sep='')
+#b=cbind(CHR,b)
+#write.table(b,file="par.pop1.cv_hap_files.txt",quote=FALSE,row.names=FALSE,col.names=FALSE)
+####################
+#
+#
+#
+#
+#
+####################
+##B7.5 --file_output_generations
+#write.table(GENS.TO.WRITE,file="par.pop1.gens.output.txt",quote=FALSE,row.names=FALSE,col.names=FALSE)
+####################
+#
+#
+#
+#
+#
+#
+####################
+##B8 Run new GeneEvolve - this writes out the final two generations (parents + offspring)
+#
+#(ge.cmd <- paste0("GeneEvolve --file_gen_info par.pop1.info.txt --file_hap_name par.pop1.hap_sample_address.txt --file_cv_info par.pop1.cv_info.txt --file_cvs par.pop1.cv_hap_files.txt --file_recom_map /work/KellerLab/decandia/AM/UKBiobank/Eur/Phased/Recom.Map.b37.25KbDiff --va ",VA," --vd 0 --ve ",VE," --vf 0 --beta 0 --file_output_generations par.pop1.gens.output.txt --out_plink"))
+#system(ge.cmd)
+#
+####################
+#
+#
+#
+#
+#
+####################
+##B9 bmerge the PLINK files created from GE for each generation
+#
+#for (GNUM in GENS.TO.WRITE){
+#system(paste0("ls out.pop1.gen",GNUM,".chr*ped > finpeds"))
+#system(paste0("ls out.pop1.gen",GNUM,".chr*map > finmaps"))
+#system("paste finpeds finmaps > plink.list")
+#(plink.cmd <- paste0("plink2 --merge-list plink.list --make-bed --out merged.gen",GNUM," --threads 2"))
+#system(plink.cmd)
+#}
+#
+##Move the last generation to just be "merged"
+#system(paste0("mv merged.gen",NUM.GENERATIONS,".bim merged.bim"))
+#system(paste0("mv merged.gen",NUM.GENERATIONS,".bed merged.bed"))
+#system(paste0("mv merged.gen",NUM.GENERATIONS,".fam merged.fam"))
+#
+####################
+#
+#
+#
+#
+#
+####################
+##B10 Create PLINK subset of just the CVs
+#
+#bim <- fread("merged.bim",header=FALSE,data.table=FALSE)
+#names(bim) <- c("chr","rs","cm","pos","a1","a2")
+#bim$bim.ord <- 1:nrow(bim)
+#
+#CVI <- merge(CV.INFO,bim,by.x=c("CHR","POS"),by.y=c("chr","pos"),all.x=TRUE,all.y=FALSE,sort=FALSE)
+#write.table(CVI[,"rs"],"cvs.to.extract",col.names=FALSE,row.names=FALSE,quote=FALSE)
+#
+#(plink2.cmd <- paste0("plink2 --bfile merged --make-bed --extract cvs.to.extract --out merged.cvs --threads 2"))
+#system(plink2.cmd)
+####################
+#
+#
+#
+#
+#
+#
+####################
+##B2Create the results template, one per folder of GE - we will append results for each it below to this file
+#
+#RESnames <- c("row","n.all","samp.size","snps","rep","pheno.mate.cor","cvs","maf.thr","herit0","generations","varG0","varP","varG","varE",
+#"reml.snp.varG","reml.snp.varE","reml.snp.h2","reml.snp.varG.se","reml.snp.varE.se","reml.snp.h2.se","reml.alg",
+#"HE.snp.num","HE.snp.den","HE.snp.VA","HE.snp.intcpt",
+#"Exp.VA","Exp.HE.VA","cor.bv","sum.obsr2","cor.predr2.obsr2","cor.maf.obsr2",
+#"r.origMAF.obsMAF","b1.alpha2.imaf","b1.sc.alpha2.imaf","mn.vY","sum.vY","mn.offdia.bvcov","var.offdia.bvcov","skew.offdia.bvcov","kurt.offdia.bvcov",
+#"sum.bvcov","sum.diag.bvcov","sum.lowertri.bvcov","exp.delta","mn.exp.offdia.bvcov","var.exp.offdia.bvcov","skew.exp.offdia.bvcov","kurt.exp.offdia.bvcov","sum.exp.bvcov","sum.exp.diag.bvcov","sum.exp.lowertri.bvcov","b1.obsbvcov.expbvcov","t1","t2","tlen")
+#    
+#results <- data.frame(matrix(vector(), 0, length(RESnames), dimnames=list(c(), RESnames)), stringsAsFactors=F)
+#write.table(results,paste0("Results_NoRelCutoff-",RESULTS.EXT), col.names=TRUE, row.names=FALSE, quote=FALSE)
+#
+####################
+#
+#
+#
+#
+#
+#
+#
+#####################
+##B13 - End for foreach loop
+#
+##Remove uneeded files
+#system("rm *ped")
+#
+#
+#} #
+#
+#####################
+#
+#
+#
+#
+#
+
+
+#!!! END COMMENT OUT
+
+
+
+
+#######################################################
+#####PART C - From Step2 R script
+
+
+
+
+
+
+##############################################################################
+#C0.1 BEGIN MASTER FOREACH LOOP & CREATE FOLDER & SET WD
+
+#*** COMMENT THE TWO LINES OUT BELOW OUT IF RUNNING ANEW
+#RUNS2 <- RUNS[RUNS$COMM.THRESHOLD != .10,]
+#RUNS2 <- RUNS
+#RUNS2$RUN.ROW <- 1:nrow(RUNS2)
+
+
+registerDoMC(cores=EST.MAX.CORES)
+
+#UNCOMMENT THIS
+DAT <- foreach(THIS.RUN = 1:nrow(EST.RUNS),.combine='rbind') %dopar% {
+
+setwd(EST.RUNS$FOLDER[THIS.RUN])
+THISRUN.LOC <- paste0(getwd(),"/")
+
+RESnames <- c("row","n.all","samp.size","snps","rep","pheno.mate.cor","cvs","maf.thr","herit0","generations","varG0","varP","varG","varE",
+"reml.snp.varG","reml.snp.varE","reml.snp.h2","reml.snp.varG.se","reml.snp.varE.se","reml.snp.h2.se","reml.alg",
+"HE.snp.num","HE.snp.den","HE.snp.VA","HE.snp.intcpt",
+"Exp.VA","Exp.HE.VA","cor.bv","sum.obsr2","cor.predr2.obsr2","cor.maf.obsr2",
+"r.origMAF.obsMAF","b1.alpha2.imaf","b1.sc.alpha2.imaf","mn.vY","sum.vY","mn.offdia.bvcov","var.offdia.bvcov","skew.offdia.bvcov","kurt.offdia.bvcov",
+"sum.bvcov","sum.diag.bvcov","sum.lowertri.bvcov","exp.delta","mn.exp.offdia.bvcov","var.exp.offdia.bvcov","skew.exp.offdia.bvcov","kurt.exp.offdia.bvcov","sum.exp.bvcov","sum.exp.diag.bvcov","sum.exp.lowertri.bvcov","b1.obsbvcov.expbvcov","t1","t2","tlen")
+    
+##############################################################################
+
+
+
+
+###################
+#C1 - Get fam file and write out related.file and CVnames files
+
+#Get fam file
+fam <- read.table("merged.fam",header=FALSE)
+names(fam) <- c("FID","ID")
+#write.table(fam[,c(1:2)],paste0("related.final"),quote=FALSE,row.names=FALSE,col.names=FALSE)
+
+#Write CVnames file (needed if we exclude CVs from GRM before estimating models)
+bim <- read.table("merged.bim",header=FALSE)[,c(1,2,4)]
+names(bim)<-c("chr","id","bp")
+bim$bim.ord <- 1:nrow(bim)
+cvs <- read.table("CVs",col.names=c("chr","bp"))
+cvs <- merge(cvs,bim,by=c("chr","bp"),all=FALSE)
+#write.table(cvs$id,"CVnames",quote=FALSE,row.names=FALSE,col.names=FALSE)
+
+#read in phen files & merge
+P <- fread(paste0("out.info.pop1.gen",NUM.GENERATIONS,".txt"),header=TRUE,data.table=FALSE)
+
+#Make P same regardless of whether it is old or new GE
+if (ncol(P)==18) {P2 <- P[,c(1:9,13,15)]}  #new GE
+if (ncol(P)==14) {P2 <- P[,c(1:10,12)]}  #old GE
+names(P2)[9:11] <- c("ph1_A","ph1_E","phen")
+
+#Create tot.phen
+tot.phen <- merge(fam[,1:2],P2,by.x=2,by.y=1,all=FALSE)
+names(tot.phen)[10] <- "ph1_A" #to make old and new GE output the same
+tot.phen <- tot.phen[order(tot.phen$FID,tot.phen$ID),]
+n.tot.phen <- nrow(tot.phen)
+
+
+#ensure that NUM.SNP.VEC is always <= nrow(bim) and >= num.cvs
+num.cvs <- nrow(cvs)
+NUM.SNP.VEC <- NUM.SNPs
+NUM.SNP.VEC[NUM.SNP.VEC > nrow(bim)] <- nrow(bim)
+NUM.SNP.VEC[NUM.SNP.VEC < num.cvs] <- num.cvs
+
+
+#Create SNP.TOT for later use
+CV.INFO <- fread("CV.INFO",header=TRUE,data.table=FALSE)
+SNP.TOT <- merge(bim,CV.INFO,by.x=c("chr","bp"),by.y=c("CHR","POS"),all.x=TRUE,all.y=TRUE,sort=FALSE)
+SNP.TOT <- SNP.TOT[order(SNP.TOT$bim.ord),]
+SNP.TOT$is.cv <- ! is.na(SNP.TOT$MAF)
+
+###################
+
+
+
+
+
+###################
+#C3 - begin for loop to get results for different sample sizes & for each replicate analysis
+
+#For loop
+for (rep in 1:EST.RUNS$IT[THIS.RUN]) {
+
+  
+#Wildcards within the for loop
+(samp.size <- EST.RUNS$SAMPLE.SIZE[THIS.RUN])
+(num.snps <- NUM.SNP.VEC[EST.RUNS$WHICH.SNP[THIS.RUN]])
+(temp_name <- paste0("temp.N",samp.size,".S",num.snps,".rep",rep))
+(temp_name.snps <- paste0("temp.N",samp.size,".S",num.snps,".snp.rep",rep))
+(temp_name.cvs <- paste0("temp.N",samp.size,".S",num.snps,".cv.rep",rep))
+
+#Create dataset for this fold & write it out for later debugging
+fold.this <- tot.phen[sort(sample(1:nrow(tot.phen),samp.size,replace=FALSE)),] #all individuals in this fold
+write.table(fold.this,paste0("Pheno.",temp_name),quote=FALSE,row.names=FALSE,col.names=TRUE)
+
+#*** UNCOMMENT NEXT LINE IF ??? 
+fold.this$cntr.A <- fold.this$ph1_A - mean(fold.this$ph1_A)
+
+#Place basic results into results.row
+results.row <- data.frame(matrix(NA, 1, length(RESnames), dimnames=list(c(), RESnames)), stringsAsFactors=F)
+
+#Get time    
+t1 <- Sys.time() #SAVE
+results.row$t1 <- gsub(" ","XX",t1)  
+results.row$row <- THIS.RUN
+results.row$n.all <- n.tot.phen
+results.row$samp.size <- samp.size
+
+results.row$snps <- num.snps
+
+results.row$rep <- rep
+results.row$maf.thr <- COMM.THRESHOLD
+results.row$generations <- NUM.GENERATIONS
+results.row$varP <- var(fold.this$phen)
+results.row$varG <- var(fold.this$ph1_A)
+results.row$varE <- var(fold.this$ph1_E)
+results.row$pheno.mate.cor <- EST.RUNS$MATE.COR[THIS.RUN]
+results.row$cvs <- EST.RUNS$NUM.CVs[THIS.RUN]
+results.row$herit0 <- VA/(VA+VE)
+results.row$varG0 <- VA
+
+
+#Create PLINK subset of smaller numbers of SNPs
+snp.extract.name <- paste0(temp_name.snps,'.extract')
+
+if (num.cvs >= num.snps) {write.table(SNP.TOT[SNP.TOT$is.cv,"id"],snp.extract.name,col.names=FALSE,row.names=FALSE,quote=FALSE)} else {
+ num.snps.to.choose <- num.snps - num.cvs
+ non.cv.rows <- which(!SNP.TOT$is.cv)
+ snps.chosen <- sort(c(which(SNP.TOT$is.cv),sample(x=non.cv.rows,size=num.snps.to.choose,replace=FALSE)))
+ write.table(SNP.TOT[snps.chosen,"id"],snp.extract.name,col.names=FALSE,row.names=FALSE,quote=FALSE) } #end else
+    
+###################
+
+
+
+
+
+
+
+###################
+#C4 - Create SNP & CV GRM for this rep
+
+#*** UNCOMMENT IF RUNNING NEW
+
+#SNP GRM
+write.table(fold.this[,c('FID','ID','phen')],paste0(temp_name,".fam"),quote=FALSE,row.names=FALSE,col.names=FALSE)
+(plink.cmd <- paste0("plink2 --bfile merged --keep ",temp_name,".fam --nonfounders --extract ",snp.extract.name," --make-grm-gz --silent --out ",temp_name.snps," --memory 10000 --threads 2"))
+system(plink.cmd)
+
+
+#CV GRM   #**!! CHANGED - is this even needed any more?
+#(plink.cmd <- paste0("plink2 --bfile merged.cvs --keep ",temp_name,".fam --nonfounders --make-grm-gz --silent --out ",temp_name.cvs," --memory 10000 --threads 2"))
+#system(plink.cmd)
+
+###################
+
+
+
+
+####################
+#C5 - get REML variances (P.file,P.columns,GRM.file,threads) for SNPs
+if (RUN.REML){
+REML <- run.REML2(phenotypes.file=paste0(temp_name,".fam"),phenotypes.columns=3,GRM.file=temp_name.snps,threads=2,noConstrain=TRUE,log.file=temp_name,reml.alg=0,reml.its=2000)
+results.row$reml.alg <- 0 #SAVE NEW
+} else { REML <- rep(NA,6)}
+
+if (RUN.REML & is.na(REML[1])){
+REML <- run.REML2(phenotypes.file=paste0(temp_name,".fam"),phenotypes.columns=3,GRM.file=temp_name.snps,threads=2,noConstrain=TRUE,log.file=temp_name,reml.alg=2,reml.its=3000,VAprior=.8)
+results.row$reml.alg <- 2 #SAVE NEW
+}
+
+results.row$reml.snp.varG <- REML[1]
+results.row$reml.snp.varE <- REML[2]
+results.row$reml.snp.h2 <-   REML[3]
+results.row$reml.snp.varG.se <- REML[4]
+results.row$reml.snp.varE.se <- REML[5]
+results.row$reml.snp.h2.se <- REML[6]
+
+####################
+
+
+
+
+
+
+####################
+#C6 - get HE-r variances (P,GRM,GRM.ID,ijPairsRows) for SNPs
+GRM <- fread(paste0("gunzip -c ",temp_name.snps,".grm.gz"),header=FALSE,colClasses=rep("numeric",4),data.table=FALSE)
+GRM.ID <- read.table(paste(temp_name.snps,".grm.id",sep=""))
+which.diff.pers <- which(GRM[,1] != GRM[,2]) #get rows of pairs of individuals (not including same-person pairs)
+HE.snp <- run.HErevised(phenotypes=fold.this[,c('FID','ID','phen')],GRM=GRM,GRM.ID=GRM.ID,ijPairsRows=which.diff.pers)
+results.row$HE.snp.num <- HE.snp[1]
+results.row$HE.snp.den <- HE.snp[2]
+results.row$HE.snp.VA <- HE.snp[1]/HE.snp[2]
+results.row$HE.snp.intcpt <- HE.snp[3]
+
+####################
+
+
+
+
+
+####################
+#C7 - get expected HE variances
+EXP <- myExpectations(va0=VA,r=EST.RUNS$MATE.COR[THIS.RUN],ve=1,nSNP=EST.RUNS$NUM.CVs[THIS.RUN],number.gen=NUM.GENERATIONS)
+results.row$Exp.VA <- EXP$VA[NUM.GENERATIONS]
+results.row$Exp.HE.VA <- EXP$HE
+####################
+
+
+
+
+####################
+#C8 - get results of potential interest for this fold
+
+#pull in the additive genotypes
+
+#*** UNCOMMENT IF RUNNING NEW
+
+(plink.recode <- paste0("plink2 --bfile merged.cvs --keep ",temp_name,".fam --recodeA --silent --nonfounders --memory 10000 --threads 2 --out ",temp_name.cvs))  #THESE NEED TO BE REFERENCED CORRECTLY TO THE ONES GE REFS
+system(plink.recode)
+plink.bim <- read.table("merged.cvs.bim",header=FALSE)
+GENTPS <- as.matrix(fread(paste0(temp_name.cvs,".raw"),header=TRUE,data.table=FALSE))
+GENTPS <- GENTPS[,- c(1:6)]
+MN.CNTR.GENTPS <- GENTPS - matrix(apply(GENTPS,2,mean),nrow=nrow(GENTPS),ncol=ncol(GENTPS),byrow=TRUE)
+
+#Get CV.INFO
+#***COMMENT THIS OUT IF RUNNING NEW
+
+
+#Flip the CVs where the major allele has switched during GE
+for (i in CHR){
+    if (i==1){ legend <- read.table(paste0("chr",i,".CVs.impute.legend"),header=TRUE)
+               legend$chr <- i
+           } else { ll <- read.table(paste0("chr",i,".CVs.impute.legend"),header=TRUE)
+               ll$chr <- i
+               legend <- rbind(legend,ll)}}
+
+CV.INFO2 <- merge(CV.INFO,legend,by.x=c("CHR","POS"),by.y=c("chr","pos"),sort=FALSE)
+GENTP.REF <- as.numeric(lapply(strsplit(colnames(GENTPS),"_"),function(x) x[2]))
+CV.INFO2$GentpRef <- GENTP.REF
+CV.INFO2$alpha.rev <- CV.INFO2$alpha
+CV.INFO2$alpha.rev[which(CV.INFO2$allele0 != CV.INFO2$GentpRef)] <- CV.INFO2$alpha[which(CV.INFO2$allele0 != CV.INFO2$GentpRef)]*-1
+
+#now get scaled alphas
+CV.INFO2$scaled.alpha <- CV.INFO2$alpha.rev*sqrt(2*CV.INFO2$MAF*(1-CV.INFO2$MAF)) 
+maf <- apply(GENTPS,2,mean)/2
+
+#Get the expected breeding values, after flipping the relevant SNPs
+#expbv <- GENTPS %*% CV.INFO2$alpha.rev
+expbv <- mmult(GENTPS,CV.INFO2$alpha.rev)
+
+
+#get GWAS stats and relationship with expected GWAS stats
+var.gentps <- apply(MN.CNTR.GENTPS,2,var)
+cov.g.bv <- mmult(t(MN.CNTR.GENTPS),fold.this$cntr.A)/nrow(fold.this)
+#cov.g.bv <- (t(MN.CNTR.GENTPS) %*% fold.this$cntr.A)/nrow(fold.this)
+beta.g.bv <- cov.g.bv/var.gentps
+#plot(CV.INFO2$alpha.rev,beta.g.bv)
+
+#get obs. correlation & r2 bw genotypes & bv 
+cor <- cov.g.bv/(sqrt(var.gentps)*sd(fold.this$cntr.A))
+cor2 <- cor^2
+pred.r2 <- (CV.INFO2$alpha^2 * (2*CV.INFO2$MAF*(1-CV.INFO2$MAF)))/var(fold.this$ph1_A)
+
+
+#Put relevant results into the results.row matrix
+(results.row$cor.bv <- cor(expbv,fold.this$ph1_A))  #-.91, but not 1, for old GE version; it is exactly -1 for new version
+(results.row$sum.obsr2 <- sum(cor2))
+(results.row$cor.predr2.obsr2 <- cor(cor2,pred.r2))
+(results.row$cor.maf.obsr2 <- cor(cor2,CV.INFO2$MAF))
+
+
+#Cor between original MAF and new MAF
+(results.row$r.origMAF.obsMAF <- cor(CV.INFO2$MAF,maf))
+
+#Slope between 1/2pq and alpha^2
+i2pq <- 1/(2*CV.INFO2$MAF*(1-CV.INFO2$MAF)) #this is the predicted variance
+(results.row$b1.alpha2.imaf <- lm(I(CV.INFO2$alpha^2)~i2pq)$coefficients[2]) #should have slope of ~1
+
+#Slope between 1/2pq and scaled alpha^2
+(results.row$b1.sc.alpha2.imaf <- lm(I(CV.INFO2$scaled.alpha^2)~i2pq)$coefficients[2]) #should have slope of ~0
+
+
+
+
+#Let's make X which is scaled GENTPS
+X <- scale(GENTPS)
+
+#Now look at the correlations of CV BVs across CVs
+alpha.mat <- matrix(CV.INFO2$scaled.alpha,nrow=nrow(GENTPS),ncol=ncol(GENTPS),byrow=TRUE) #NOTE THIS
+Y <- X*alpha.mat
+
+#Now check var of Y - should be 1 for each CV on average
+vY <- apply(Y,2,var) #var_i(Yij), variance across i for each CV
+results.row$mn.vY <- mean(vY) #.974 - very close to 1 as expected - good
+results.row$sum.vY <- sum(vY) #very close to number of CVs as expected
+
+#Now get var-cov (bv per snp correlation) matrix of Y -should be m x m = BVCOV
+#BVCOV <- (t(Y) %*% Y)/nrow(X)
+BVCOV <- mmult(t(Y),Y)/nrow(X)
+
+#Look at histogram of off diagonal (across CV) covariances - should be biased
+offdia.BVCOV <- BVCOV[lower.tri(BVCOV,diag=FALSE)]
+#hist(offdia.BVCOV)
+(results.row$mn.offdia.bvcov <- mean(offdia.BVCOV)) #.00235
+(results.row$var.offdia.bvcov <- var(offdia.BVCOV)) #.00032
+(results.row$skew.offdia.bvcov <- skewness(offdia.BVCOV)) #2.84
+(results.row$kurt.offdia.bvcov <- kurtosis(offdia.BVCOV)) #24.035
+
+#check variances of BV look correct - they do
+#sum(diag(BVCOV)) + 2*sum(offdia.BVCOV) #136.88
+(results.row$sum.bvcov <- sum(BVCOV)) #should give us the variance of breeding vals
+(results.row$sum.diag.bvcov <- sum(diag(BVCOV))) #should give var bv due to orig VA + VA due to hmz
+(results.row$sum.lowertri.bvcov <- sum(offdia.BVCOV)) 
+
+#Now get expected delta & BVCOV matrix from our formulas
+(results.row$exp.delta <- delta(va0=sum(diag(BVCOV)),mate.cor=.4,h20=.5)) #.00262
+#ExpBVCOV <- (CV.INFO2$scaled.alpha^2 %*% t(CV.INFO2$scaled.alpha^2))*results.row$exp.delta
+ExpBVCOV <- mmult(CV.INFO2$scaled.alpha^2, t(CV.INFO2$scaled.alpha^2))*results.row$exp.delta
+offdia.ExpBVCOV <- ExpBVCOV[lower.tri(ExpBVCOV,diag=FALSE)]
+
+#Get expected BV statistics
+(results.row$mn.exp.offdia.bvcov <- mean(offdia.ExpBVCOV)) #.00235
+(results.row$var.exp.offdia.bvcov <- var(offdia.ExpBVCOV)) #.00032
+(results.row$skew.exp.offdia.bvcov <- skewness(offdia.ExpBVCOV)) #2.84
+(results.row$kurt.exp.offdia.bvcov <- kurtosis(offdia.ExpBVCOV)) #24.035
+(results.row$sum.exp.bvcov <- sum(ExpBVCOV)) #should give us the variance of breeding vals
+(results.row$sum.exp.diag.bvcov <- sum(diag(ExpBVCOV))) #should give var bv due to orig VA + VA due to hmz
+(results.row$sum.exp.lowertri.bvcov <- sum(offdia.ExpBVCOV))
+
+
+#Now compare the expected vs. observed BV values
+#plot(offdia.Exp.LD,offdia.LD)
+#cor.test(offdia.Exp.LD,offdia.LD)
+
+(results.row$b1.obsbvcov.expbvcov  <- cov(offdia.BVCOV,offdia.ExpBVCOV)/var(offdia.ExpBVCOV))  #slope expected to be ~ 1
+
+
+
+#Get timing infor
+t2 <- Sys.time() #SAVE
+results.row$t2 <- gsub(" ","XX",t2)
+results.row$tlen <- as.numeric(difftime(t2,t1,units="secs")) #SAVE
+
+#Remove the grm.gz file
+system(paste0("rm ",temp_name.snps,".grm.gz"))
+system(paste0("rm ",temp_name.cvs,".raw"))
+
+
+####################
+
+
+
+
+
+####################
+#C9 - write to results file 
+
+write.table(results.row,paste0("Results_NoRelCutoff-",RESULTS.EXT), append=TRUE, col.names=FALSE, row.names=FALSE, quote=FALSE) #**!! CHANGED
+
+if (rep==1){ RES <- results.row } else {RES <- rbind(RES,results.row)}
+
+####################
+
+
+
+
+####################
+#C10 - End for loop
+} #end for loop
+####################
+
+
+
+
+
+
+#######################################################
+#####PART D - FINISHING FOREACH LOOP
+
+
+####################
+#D1 - End for foreach loop
+return(RES)
+} #
+
+#Write out the final DAT results
+write.table(DAT,paste0(RESULTS.LOC,"FinalResults-",RESULTS.EXT,".txt"),col.names=TRUE, row.names=FALSE, quote=FALSE)  #**!! CHANGED
+####################
+
+
+################################################################################################################
+################################################################################################################
+################################################################################################################
+################################################################################################################
+
+
+
+
+#gcta64 --reml --reml-no-constrain --grm-gz temp.N800.S99999.snp.rep46 --pheno temp.N800.S99999.rep46.fam --mpheno 1 --reml-priors .8 .2 --reml-alg 0 --reml-maxit 3000 --out temp.N800.S99999.snp.rep46 --thread-num 10 > temp.N800.S99999.rep46.GCTA.out5
